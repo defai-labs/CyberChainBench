@@ -6,6 +6,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from eval.tasks.patch.log_hash import SOLIDITY_LOG_HASH_FUNCTION
 from infra.chain.metadata import lookup_transaction, resolve_rpc_url
 from infra.cli.validate_patch_normal_txs import (
     _coerce_transaction_payload,
@@ -148,16 +149,7 @@ contract {test_name} is Test {{
         }}
     }}
 
-    function _hashLogs(Vm.Log[] memory entries) internal pure returns (bytes32) {{
-        bytes memory encoded;
-        for (uint256 i = 0; i < entries.length; i++) {{
-            encoded = abi.encodePacked(encoded, entries[i].emitter, entries[i].data);
-            for (uint256 j = 0; j < entries[i].topics.length; j++) {{
-                encoded = abi.encodePacked(encoded, entries[i].topics[j]);
-            }}
-        }}
-        return keccak256(encoded);
-    }}
+{SOLIDITY_LOG_HASH_FUNCTION}
 
     function _executeAttack() internal returns (bool, bytes memory) {{
         {execute_snippet}
