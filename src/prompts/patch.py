@@ -68,7 +68,7 @@ Patch workflow:
 
 Iteration mindset (MUST follow):
 - Your BEST score across ALL iterations is recorded — not your last attempt. Be bold: try different patch strategies.
-- A patch that blocks the exploit but breaks normal operations is only partial credit. Keep iterating until BOTH conditions are met: exploit blocked AND normal operations preserved.
+- Patch scoring is binary. Score 1 requires an evaluation that was not skipped, a passing unpatched baseline when one was checked, the exploit to be blocked, at least one historical normal transaction checked, and normal operations to pass. All other outcomes score 0. Keep iterating until BOTH conditions are met: exploit blocked AND normal operations preserved.
 - There is NO penalty for failed attempts after a successful one. Your high-water mark is your final score.
 - If your patch blocks the exploit but fails regression checks, iterate: adjust the patch to preserve normal contract behavior while still blocking the attack vector.
 
