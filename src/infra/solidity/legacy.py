@@ -11,7 +11,11 @@ from pathlib import Path
 
 from infra.chain.metadata import resolve_case_source_metadata
 from infra.foundry.exploit_runner import _build_foundry_env, _resolve_forge_bin
-from infra.solidity.fixed_sources import rewrite_imports_to_local_flat_files
+from infra.solidity.fixed_sources import (
+    normalize_staged_source_path,
+    resolve_staged_source_path,
+    rewrite_imports_to_local_flat_files,
+)
 from infra.solidity.solc_resolver import (
     extract_solc_version,
     get_or_install_solc,
@@ -460,8 +464,12 @@ def _forge_compile_fallback(
     try:
         src_dir = tmp_dir / "src"
         src_dir.mkdir()
+        destinations: set[Path] = set()
         for name, content in sources.items():
-            dest = src_dir / name
+            dest = resolve_staged_source_path(src_dir, name)
+            if dest in destinations:
+                raise RuntimeError(f"duplicate staged Solidity source path: {name}")
+            destinations.add(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(content)
 
@@ -482,12 +490,29 @@ def _forge_compile_fallback(
                     continue
                 lhs, rhs = r.split("=", 1)
                 if not rhs.startswith("src/"):
-                    rhs = "src/" + rhs
+                    rhs = "src/" + rhs.lstrip("/")
                 remappings.append(f"{lhs}={rhs}")
                 covered_prefixes.add(lhs.rstrip("/"))
         for name in sources:
-            parts = name.split("/")
-            if parts[0] == "node_modules" and len(parts) > 1:
+            parts = normalize_staged_source_path(name).parts
+            if parts[0].startswith("@"):
+                scope = parts[0]
+                if scope not in covered_prefixes:
+                    covered_prefixes.add(scope)
+                    remappings.append(f"{scope}/=src/{scope}/")
+                rooted_scope = f"/{scope}"
+                if str(name).startswith("/") and rooted_scope not in covered_prefixes:
+                    covered_prefixes.add(rooted_scope)
+                    remappings.append(f"{rooted_scope}/=src/{scope}/")
+            elif str(name).startswith("/"):
+                root_prefix = f"/{parts[0]}"
+                if root_prefix not in covered_prefixes:
+                    covered_prefixes.add(root_prefix)
+                    if len(parts) == 1:
+                        remappings.append(f"{root_prefix}=src/{parts[0]}")
+                    else:
+                        remappings.append(f"{root_prefix}/=src/{parts[0]}/")
+            elif parts[0] == "node_modules" and len(parts) > 1:
                 scope = parts[1] if parts[1].startswith("@") else None
                 if scope and scope not in covered_prefixes:
                     covered_prefixes.add(scope)

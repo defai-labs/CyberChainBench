@@ -3,9 +3,42 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _IMPORT_RE = re.compile(r'(import\s+(?:[^"\']+\s+from\s+)?["\'])([^"\']+)(["\'])')
+
+
+def normalize_staged_source_path(source_path: str) -> PurePosixPath:
+    """Normalize one explorer source name to a confined relative path."""
+    text = str(source_path)
+    if not text or "\x00" in text:
+        raise RuntimeError("invalid empty Solidity source path")
+    if text.startswith("//") or "\\" in text or re.match(r"^/*[A-Za-z]:", text):
+        raise RuntimeError(f"unsupported Solidity source path: {text}")
+
+    relative = PurePosixPath(text.lstrip("/"))
+    if not relative.parts or any(part == ".." for part in relative.parts):
+        raise RuntimeError(f"unsafe Solidity source path: {text}")
+    return relative
+
+
+def resolve_staged_source_path(target_dir: Path, source_path: str) -> Path:
+    """Resolve an explorer source name beneath *target_dir*.
+
+    Solidity standard-json inputs may use root-relative logical names such as
+    ``/contracts/Token.sol``.  Those names are not host filesystem paths.  Drop
+    their leading slash while rejecting traversal and path collisions outside
+    the staging root.
+    """
+    relative = normalize_staged_source_path(source_path)
+
+    root = target_dir.resolve()
+    destination = target_dir.joinpath(*relative.parts)
+    try:
+        destination.resolve().relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe Solidity source path: {source_path}") from exc
+    return destination
 
 
 def unflatten_source_filename(flat_name: str) -> str:
@@ -179,8 +212,8 @@ def stage_reference_sources_structured(
 ) -> tuple[list[Path], set[str]]:
     """Write reference sources preserving directory structure under *target_dir*.
 
-    Returns ``(staged_paths, scoped_prefixes)`` where *scoped_prefixes* is the
-    set of ``@scope`` prefixes (e.g. ``{"@openzeppelin"}``).
+    Returns ``(staged_paths, scoped_prefixes)`` where *scoped_prefixes* contains
+    import prefixes that need remapping into the structured source tree.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -192,16 +225,25 @@ def stage_reference_sources_structured(
     scoped_prefixes: set[str] = set()
     staged_paths: list[Path] = []
 
+    destinations: set[Path] = set()
     for source_path, source_code in reference_sources.items():
         content = fixed_code if source_path == target_key else source_code
-        output_path = target_dir / source_path
+        output_path = resolve_staged_source_path(target_dir, source_path)
+        if output_path in destinations:
+            raise RuntimeError(f"duplicate staged Solidity source path: {source_path}")
+        destinations.add(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content)
         staged_paths.append(output_path)
 
-        if source_path.startswith("@"):
-            prefix = source_path.split("/")[0]
-            scoped_prefixes.add(prefix)
+        logical_path = normalize_staged_source_path(source_path)
+        first_part = logical_path.parts[0]
+        if first_part.startswith("@"):
+            scoped_prefixes.add(first_part)
+            if str(source_path).startswith("/"):
+                scoped_prefixes.add(f"/{first_part}")
+        elif str(source_path).startswith("/"):
+            scoped_prefixes.add(f"/{first_part}")
 
     fixed_output = target_dir / fixed_file_name
     if not fixed_output.exists() or fixed_output.read_text(errors="replace") != fixed_code:
