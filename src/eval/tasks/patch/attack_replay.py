@@ -22,6 +22,7 @@ from infra.foundry.workspace import (
     create_isolated_eval_workspace,
 )
 from infra.solidity.fixed_sources import stage_reference_sources_structured
+from eval.tasks.patch.replay_accounting import summarize_attack_replay_results
 
 
 def _run_forge(
@@ -390,6 +391,7 @@ def validate_patch_attack_transactions(
                 timeout=max(int(timeout), 1),
             )
             output = (test_result.stdout or "") + (test_result.stderr or "")
+            resource_failure = "MemoryOOG" in output or "OutOfGas" in output
             compile_failed = bool(
                 test_result.returncode != 0 and "FAIL" not in output and "PASS" not in output
             )
@@ -414,6 +416,7 @@ def validate_patch_attack_transactions(
                     "blocked": blocked,
                     "checked": checked,
                     "compile_failed": compile_failed,
+                    "resource_failure": resource_failure,
                     "returncode": test_result.returncode,
                     "test_path": str(test_file),
                     "forge_output_path": output_path,
@@ -422,14 +425,13 @@ def validate_patch_attack_transactions(
             )
 
         payload["results"] = results
-        payload["checked_count"] = sum(1 for item in results if item.get("checked"))
-        payload["blocked_count"] = sum(1 for item in results if item.get("blocked"))
+        payload.update(
+            summarize_attack_replay_results(results, selected_count=len(selected))
+        )
         payload["compile_failures"] = sum(1 for item in results if item.get("compile_failed"))
         payload["compile_ok"] = bool(results) and not any(
             item.get("compile_failed") for item in results
         )
-        payload["all_blocked"] = bool(results) and all(item.get("blocked") for item in results)
-        payload["ok"] = bool(results)
         payload["summary"] = (
             f"replayed {len(results)} historical attack transaction(s); "
             f"{payload['blocked_count']} blocked by patch"

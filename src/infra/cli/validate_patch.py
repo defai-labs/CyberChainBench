@@ -12,6 +12,7 @@ from agents.task_agent.base import AgentResponse, TaskType
 from benchmark.loader import BenchmarkLoader
 from eval.tasks.patch.attack_replay import validate_patch_attack_transactions
 from eval.tasks.patch import evaluate_patch, write_patch_score_artifact
+from eval.tasks.patch.replay_accounting import summarize_normal_replay_results
 
 # Backwards-compatible aliases
 validate_fix_attack_transactions = validate_patch_attack_transactions
@@ -1327,10 +1328,10 @@ contract {test_name} is Test {{
         (bool beforeOk, bytes32 beforeRet, bytes32 beforeLogs) = _runHistoricalCall();
         (bool afterOk, bytes32 afterRet, bytes32 afterLogs) = _runPatchedCall();
 
+        emit log_string("NORMAL_TX_REPLAY_CHECKED");
         assertEq(afterOk, beforeOk, "success changed");
         assertEq(afterRet, beforeRet, "return data changed");
         assertEq(afterLogs, beforeLogs, "logs changed");
-        emit log_string("NORMAL_TX_REPLAY_CHECKED");
     }}
 }}
 """
@@ -1565,7 +1566,6 @@ def validate_patch_normal_transactions(
             payload["patched_code_path"] = str(artifact_fixed)
 
         results: list[dict[str, object]] = []
-        all_preserved = True
         payload["rpc_configured"] = bool(resolve_rpc_url(chain))
 
         for index, tx in enumerate(selected, start=1):
@@ -1607,10 +1607,6 @@ def validate_patch_normal_transactions(
             output = (test_result.stdout or "") + (test_result.stderr or "")
             is_oog = "MemoryOOG" in output or "OutOfGas" in output
             preserved = bool(test_result.returncode == 0 and "PASS" in (test_result.stdout or ""))
-            # MemoryOOG is inconclusive (vm.etch bytecode mismatch), not a patch failure
-            if is_oog:
-                preserved = True
-            all_preserved = all_preserved and preserved
             output_path = ""
             if entry_artifact_dir is not None:
                 output_path = str(entry_artifact_dir / "forge_output.txt")
@@ -1628,6 +1624,7 @@ def validate_patch_normal_transactions(
                     "preserved": preserved,
                     "returncode": test_result.returncode,
                     "checked": "NORMAL_TX_REPLAY_CHECKED" in output,
+                    "resource_failure": is_oog,
                     "test_path": str(test_file),
                     "forge_output_path": output_path,
                     "test_output": output[-1000:] if output else "",
@@ -1635,13 +1632,12 @@ def validate_patch_normal_transactions(
             )
 
         payload["results"] = results
-        payload["checked_count"] = len(results)
-        payload["preserved_count"] = sum(1 for item in results if item.get("preserved"))
-        payload["all_preserved"] = all_preserved and bool(results)
-        payload["ok"] = bool(results)
+        payload.update(
+            summarize_normal_replay_results(results, selected_count=len(selected))
+        )
         payload["summary"] = (
             f"replayed {len(results)} historical normal transaction(s); "
-            f"{sum(1 for item in results if item.get('preserved'))} preserved"
+            f"{payload['preserved_count']} preserved"
         )
         return payload
     except subprocess.TimeoutExpired:
