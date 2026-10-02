@@ -102,12 +102,17 @@ def write_structured_source_remappings(
     test_dir_rel: str,
     scoped_prefixes: set[str],
 ) -> None:
-    """Append remappings for @-scoped imports pointing into the structured source tree."""
+    """Append import remappings pointing into the structured source tree."""
     if not scoped_prefixes:
         return
     lines: list[str] = []
     for prefix in sorted(scoped_prefixes):
-        lines.append(f"{prefix}/=src/{test_dir_rel}/{prefix}/")
+        if prefix.startswith("/") and prefix.endswith(".sol"):
+            source_name = prefix
+            lines.append(f"{source_name}=src/{test_dir_rel}/{source_name.lstrip('/')}")
+        else:
+            staged_prefix = prefix.lstrip("/")
+            lines.append(f"{prefix}/=src/{test_dir_rel}/{staged_prefix}/")
     remappings_path = workspace / "remappings.txt"
     existing = remappings_path.read_text().rstrip("\n") if remappings_path.exists() else ""
     new_block = "\n".join(lines)

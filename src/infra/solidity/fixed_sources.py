@@ -3,9 +3,189 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _IMPORT_RE = re.compile(r'(import\s+(?:[^"\']+\s+from\s+)?["\'])([^"\']+)(["\'])')
+_CONTRACT_DECLARATION_RE = re.compile(
+    r"(?<![A-Za-z0-9_$])"
+    r"(?:abstract\s+)?(?:contract|library|interface)\s+"
+    r"(?P<name>[A-Za-z_$][A-Za-z0-9_$]*)(?![A-Za-z0-9_$])",
+)
+_SOLIDITY_COMMENT_OR_STRING_RE = re.compile(
+    r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
+    re.DOTALL,
+)
+
+
+def _declared_contract_names(source: str) -> set[str]:
+    def _erase(match: re.Match[str]) -> str:
+        return "".join("\n" if char == "\n" else " " for char in match.group(0))
+
+    stripped = _SOLIDITY_COMMENT_OR_STRING_RE.sub(_erase, str(source or ""))
+    return {
+        match.group("name")
+        for match in _CONTRACT_DECLARATION_RE.finditer(stripped)
+    }
+
+
+def normalize_staged_source_path(source_path: str) -> PurePosixPath:
+    """Normalize one explorer source name to a confined relative path."""
+    text = str(source_path)
+    if not text or "\x00" in text:
+        raise RuntimeError("invalid empty Solidity source path")
+    if text.startswith("//") or "\\" in text or re.match(r"^/*[A-Za-z]:", text):
+        raise RuntimeError(f"unsupported Solidity source path: {text}")
+
+    relative = PurePosixPath(text.lstrip("/"))
+    if not relative.parts or any(part == ".." for part in relative.parts):
+        raise RuntimeError(f"unsafe Solidity source path: {text}")
+    return relative
+
+
+def resolve_staged_source_path(target_dir: Path, source_path: str) -> Path:
+    """Resolve an explorer source name beneath *target_dir*.
+
+    Solidity standard-json inputs may use root-relative logical names such as
+    ``/contracts/Token.sol``.  Those names are not host filesystem paths.  Drop
+    their leading slash while rejecting traversal and path collisions outside
+    the staging root.
+    """
+    relative = normalize_staged_source_path(source_path)
+
+    root = target_dir.resolve()
+    destination = target_dir.joinpath(*relative.parts)
+    try:
+        destination.resolve().relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError(f"unsafe Solidity source path: {source_path}") from exc
+    return destination
+
+
+def resolve_reference_source_unit(
+    *,
+    reference_sources: dict[str, str],
+    source_unit_hints: list[str] | None = None,
+    contract_name_hint: str = "",
+) -> str:
+    """Resolve one exact source-unit key without relying on mapping order.
+
+    Explorer standard-json keys are compiler identities, not host paths.  A
+    public case file hint may name either the complete unit or its basename.
+    When no file hint identifies a unique unit, the explorer contract name may
+    identify the one unit that declares it.  Ambiguity is an error because
+    replacing or selecting a different source unit changes the graded program.
+    """
+    if not reference_sources:
+        raise RuntimeError("verified source bundle is empty")
+
+    keys = list(reference_sources)
+
+    resolved_hints: list[str] = []
+    supplied_hints = [str(item or "").strip() for item in (source_unit_hints or [])]
+    supplied_hints = [item for item in supplied_hints if item]
+    for hint in supplied_hints:
+        try:
+            normalized_hint = normalize_staged_source_path(hint)
+        except RuntimeError as exc:
+            raise RuntimeError(f"invalid verified source-unit hint: {hint}") from exc
+        if hint in reference_sources:
+            resolved_hints.append(hint)
+            continue
+        normalized_matches = [
+            key
+            for key in keys
+            if normalize_staged_source_path(key) == normalized_hint
+        ]
+        if len(normalized_matches) == 1:
+            resolved_hints.append(normalized_matches[0])
+            continue
+        if len(normalized_matches) > 1:
+            raise RuntimeError(f"ambiguous verified source-unit hint: {hint}")
+
+        basename = normalized_hint.name
+        basename_matches = [
+            key
+            for key in keys
+            if normalize_staged_source_path(key).name == basename
+        ]
+        if len(basename_matches) == 1:
+            resolved_hints.append(basename_matches[0])
+            continue
+        if len(basename_matches) > 1:
+            raise RuntimeError(f"ambiguous verified source-unit basename: {hint}")
+        raise RuntimeError(f"verified source-unit hint not found: {hint}")
+
+    if resolved_hints:
+        unique_resolutions = list(dict.fromkeys(resolved_hints))
+        if len(unique_resolutions) != 1:
+            raise RuntimeError("conflicting verified source-unit hints")
+        return unique_resolutions[0]
+
+    contract_name = str(contract_name_hint or "").strip()
+    if contract_name:
+        declaration_matches = []
+        for key, source in reference_sources.items():
+            declared = _declared_contract_names(source)
+            if contract_name in declared:
+                declaration_matches.append(key)
+        if len(declaration_matches) == 1:
+            return declaration_matches[0]
+        if len(declaration_matches) > 1:
+            raise RuntimeError(
+                f"contract {contract_name} is declared in multiple verified source units"
+            )
+
+    if len(keys) == 1:
+        return keys[0]
+    raise RuntimeError("could not identify the target verified source unit")
+
+
+def resolve_reference_contract_source_unit(
+    *,
+    reference_sources: dict[str, str],
+    contract_name: str,
+) -> str:
+    """Resolve the unique original source unit declaring a trusted contract."""
+    trusted_name = str(contract_name or "").strip()
+    if not trusted_name:
+        raise RuntimeError("missing trusted artifact contract name")
+    matches = [
+        key
+        for key, source in reference_sources.items()
+        if trusted_name in _declared_contract_names(source)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise RuntimeError(
+            f"contract {trusted_name} is declared in multiple verified source units"
+        )
+    raise RuntimeError(
+        f"contract {trusted_name} is not declared in the verified source bundle"
+    )
+
+
+def public_source_unit_hints(
+    raw_case: dict | None,
+    contracts: dict | None,
+) -> list[str]:
+    """Collect source-unit hints that are part of the public Patch input."""
+    hints: list[str] = []
+
+    def _append(value: object) -> None:
+        text = str(value or "").strip()
+        if text and text not in hints:
+            hints.append(text)
+
+    raw = raw_case if isinstance(raw_case, dict) else {}
+    for key in ("file", "vulnerable_contract_file", "source_file"):
+        _append(raw.get(key))
+    if hints:
+        return hints
+    public_contracts = contracts if isinstance(contracts, dict) else {}
+    for value in public_contracts.get("vulnerable", []) or []:
+        _append(value)
+    return hints
 
 
 def unflatten_source_filename(flat_name: str) -> str:
@@ -179,8 +359,8 @@ def stage_reference_sources_structured(
 ) -> tuple[list[Path], set[str]]:
     """Write reference sources preserving directory structure under *target_dir*.
 
-    Returns ``(staged_paths, scoped_prefixes)`` where *scoped_prefixes* is the
-    set of ``@scope`` prefixes (e.g. ``{"@openzeppelin"}``).
+    Returns ``(staged_paths, scoped_prefixes)`` where *scoped_prefixes* contains
+    import prefixes that need remapping into the structured source tree.
     """
     target_dir.mkdir(parents=True, exist_ok=True)
 
@@ -192,16 +372,25 @@ def stage_reference_sources_structured(
     scoped_prefixes: set[str] = set()
     staged_paths: list[Path] = []
 
+    destinations: set[Path] = set()
     for source_path, source_code in reference_sources.items():
         content = fixed_code if source_path == target_key else source_code
-        output_path = target_dir / source_path
+        output_path = resolve_staged_source_path(target_dir, source_path)
+        if output_path in destinations:
+            raise RuntimeError(f"duplicate staged Solidity source path: {source_path}")
+        destinations.add(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content)
         staged_paths.append(output_path)
 
-        if source_path.startswith("@"):
-            prefix = source_path.split("/")[0]
-            scoped_prefixes.add(prefix)
+        logical_path = normalize_staged_source_path(source_path)
+        first_part = logical_path.parts[0]
+        if first_part.startswith("@"):
+            scoped_prefixes.add(first_part)
+            if str(source_path).startswith("/"):
+                scoped_prefixes.add(f"/{first_part}")
+        elif str(source_path).startswith("/"):
+            scoped_prefixes.add(f"/{first_part}")
 
     fixed_output = target_dir / fixed_file_name
     if not fixed_output.exists() or fixed_output.read_text(errors="replace") != fixed_code:

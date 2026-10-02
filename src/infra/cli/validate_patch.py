@@ -23,7 +23,13 @@ from infra.solidity.legacy import (
     compile_fixed_bytecode_from_source,
     infer_solc_version_from_source,
 )
-from infra.solidity.fixed_sources import stage_reference_sources_structured, unflatten_source_filename
+from infra.solidity.fixed_sources import (
+    public_source_unit_hints,
+    resolve_reference_contract_source_unit,
+    resolve_reference_source_unit,
+    stage_reference_sources_structured,
+    unflatten_source_filename,
+)
 from infra.foundry.workspace import (
     cleanup_isolated_eval_workspace,
     create_isolated_eval_workspace,
@@ -55,6 +61,19 @@ def _run_forge(cmd: list[str], *, cwd: Path, timeout: int):
 
 
 _WORKSPACE_CASE_DATA = Path("/app/workspace/case_data.json")
+_WORKSPACE_CASE_INPUT = Path("/app/workspace/CASE_INPUT.txt")
+
+
+def _workspace_public_file_hint(path: Path = _WORKSPACE_CASE_INPUT) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "file":
+            return value.strip()
+    return ""
 
 
 def _resolve_case(base_dir: Path, case_id: str, benchmark_dir: Path | None = None):
@@ -65,6 +84,10 @@ def _resolve_case(base_dir: Path, case_id: str, benchmark_dir: Path | None = Non
         try:
             data = json.loads(_WORKSPACE_CASE_DATA.read_text())
             if data.get("id") == case_id or not case_id:
+                if not str(data.get("file", "")).strip():
+                    file_hint = _workspace_public_file_hint()
+                    if file_hint:
+                        data["file"] = file_hint
                 return PatchCase.from_json(data)
         except (json.JSONDecodeError, OSError, KeyError):
             pass
@@ -157,15 +180,20 @@ def _patch_source_metadata(case, base_dir: Path) -> dict:
     )
 
 
-def _load_reference_sources(case, base_dir: Path) -> tuple[dict[str, str], list[str]]:
+def _load_reference_sources(
+    case, base_dir: Path
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
     """Load reference sources with full logical paths as keys.
 
-    Returns (sources, remappings).
+    Returns (sources, remappings, public metadata).
     """
     from infra.chain.metadata import lookup_verified_source
 
     verification = case.verification or {}
     metadata = _patch_source_metadata(case, base_dir)
+    public_metadata = {
+        "contract_name": str(metadata.get("target_contract_name", "")).strip(),
+    }
     source_dir_text = (
         str(verification.get("source_dir", "")).strip()
         or str(metadata.get("source_dir", "")).strip()
@@ -190,11 +218,11 @@ def _load_reference_sources(case, base_dir: Path) -> tuple[dict[str, str], list[
                     logical_path = unflatten_source_filename(full_path.name)
                     sources[logical_path] = full_path.read_text(errors="replace")
             if sources:
-                return sources, []
+                return sources, [], public_metadata
 
     local_sources = case.get_vulnerable_code(base_dir)
     if local_sources:
-        return local_sources, []
+        return local_sources, [], public_metadata
 
     candidate_addresses: list[str] = []
     vulnerable_address = str((getattr(case, "contracts", None) or {}).get("vulnerable_address", "")).strip()
@@ -221,9 +249,11 @@ def _load_reference_sources(case, base_dir: Path) -> tuple[dict[str, str], list[
             remappings = verified.get("remappings", [])
             if not isinstance(remappings, list):
                 remappings = []
-            return sources, remappings
+            return sources, remappings, {
+                "contract_name": str(verified.get("contract_name", "")).strip(),
+            }
 
-    return {}, []
+    return {}, [], public_metadata
 
 
 def _parse_int(value: object) -> int | None:
@@ -1353,8 +1383,6 @@ def _prepare_fixed_code_line(case, base_dir: Path, fixed_code: str) -> tuple[str
             str(ground_truth.get("file", "")).strip(),
         ],
     )
-    if not contract_name:
-        return None, "", "failed to parse contract name from fixed code"
 
     compiler_version = (
         str(verification.get("compiler_version", "")).strip()
@@ -1380,7 +1408,35 @@ def _prepare_fixed_code_line(case, base_dir: Path, fixed_code: str) -> tuple[str
                 metadata["optimization_used"] = explorer_meta.get("optimization_used", True)
                 metadata["optimization_runs"] = explorer_meta.get("optimization_runs", 200)
                 metadata["evm_version"] = explorer_meta.get("evm_version", "")
-    reference_sources, source_remappings = _load_reference_sources(case, base_dir)
+    reference_sources, source_remappings, public_source_metadata = _load_reference_sources(
+        case, base_dir
+    )
+    trusted_contract_name = (
+        str(public_source_metadata.get("contract_name", "")).strip()
+        or str(metadata.get("target_contract_name", "")).strip()
+    )
+    if trusted_contract_name:
+        contract_name = trusted_contract_name
+    target_source_unit = ""
+    artifact_source_unit = ""
+    if reference_sources:
+        try:
+            target_source_unit = resolve_reference_source_unit(
+                reference_sources=reference_sources,
+                source_unit_hints=public_source_unit_hints(
+                    getattr(case, "raw", {}),
+                    getattr(case, "contracts", {}),
+                ),
+                contract_name_hint=trusted_contract_name,
+            )
+            artifact_source_unit = resolve_reference_contract_source_unit(
+                reference_sources=reference_sources,
+                contract_name=trusted_contract_name,
+            )
+        except RuntimeError as exc:
+            return None, "", f"failed to identify target source unit: {exc}"
+    elif not contract_name:
+        return None, "", "failed to parse contract name from fixed code"
     try:
         if str(metadata.get("source_dir", "")).strip():
             bytecode, _, compiled_contract_name = compile_dfhl_fixed_bytecode(
@@ -1391,6 +1447,8 @@ def _prepare_fixed_code_line(case, base_dir: Path, fixed_code: str) -> tuple[str
                 contract_name_hint=contract_name
                 or str(verification.get("target_contract_name", "")).strip()
                 or str(metadata.get("target_contract_name", "")).strip(),
+                target_source_unit=target_source_unit,
+                artifact_source_unit=artifact_source_unit,
             )
         else:
             bytecode, compiled_contract_name = compile_fixed_bytecode_from_source(
@@ -1402,6 +1460,8 @@ def _prepare_fixed_code_line(case, base_dir: Path, fixed_code: str) -> tuple[str
                 evm_version=str(metadata.get("evm_version", "") or ""),
                 reference_sources=reference_sources,
                 source_remappings=source_remappings,
+                target_source_unit=target_source_unit,
+                artifact_source_unit=artifact_source_unit,
             )
         if compiled_contract_name:
             contract_name = compiled_contract_name
@@ -1409,13 +1469,14 @@ def _prepare_fixed_code_line(case, base_dir: Path, fixed_code: str) -> tuple[str
         return fixed_code_line, "", ""
     except RuntimeError as exc:
         canonical_fixed = _canonical_source(sanitized_fixed_code)
-        canonical_originals = {
-            _canonical_source(code)
-            for code in reference_sources.values()
-        }
+        canonical_original = (
+            _canonical_source(reference_sources[target_source_unit])
+            if target_source_unit
+            else ""
+        )
         vulnerable_address = _pick_case_contract_address(case)
         fork_block = _pick_case_fork_block(case)
-        if canonical_fixed in canonical_originals and vulnerable_address:
+        if canonical_fixed == canonical_original and canonical_original and vulnerable_address:
             runtime_code = lookup_runtime_code(
                 case.chain_context.get("fork_chain", "") or case.chain or "ethereum",
                 vulnerable_address,
@@ -1541,7 +1602,7 @@ def validate_patch_normal_transactions(
             )
             metadata = _patch_source_metadata(case, base_dir)
             verification = case.verification or {}
-            reference_sources, _ = _load_reference_sources(case, base_dir)
+            reference_sources, _, _ = _load_reference_sources(case, base_dir)
             staged_paths, scoped_prefixes = stage_reference_sources_structured(
                 target_dir=test_dir,
                 reference_sources=reference_sources,

@@ -326,7 +326,7 @@ def validate_patch_attack_transactions(
             )
             metadata = _fix_source_metadata(case, base_dir)
             verification = case.verification or {}
-            reference_sources, _ = _load_reference_sources(case, base_dir)
+            reference_sources, _, _ = _load_reference_sources(case, base_dir)
             staged_paths, scoped_prefixes = stage_reference_sources_structured(
                 target_dir=test_dir,
                 reference_sources=reference_sources,

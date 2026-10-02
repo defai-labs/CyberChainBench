@@ -46,6 +46,11 @@ from infra.solidity.legacy import (
     compile_fixed_bytecode_from_source,
     infer_solc_version_from_source,
 )
+from infra.solidity.fixed_sources import (
+    public_source_unit_hints,
+    resolve_reference_contract_source_unit,
+    resolve_reference_source_unit,
+)
 from project_layout import resolve_repo_path
 
 TEMP_DIR_NAME = "_benchmark_eval"
@@ -466,10 +471,10 @@ def _apply_patch_expectations(
 
 def _load_reference_sources(
     case: PatchCase, base_dir: Path
-) -> tuple[dict[str, str], list[str]]:
+) -> tuple[dict[str, str], list[str], dict[str, str]]:
     """Load reference Solidity sources for a fix case.
 
-    Returns (sources, remappings).  Keys are full logical paths
+    Returns (sources, remappings, public metadata).  Keys are full logical paths
     (e.g. ``contracts/Monoswap.sol``).  Remappings come from the
     verified-source metadata when available.
     """
@@ -477,6 +482,9 @@ def _load_reference_sources(
 
     verification = case.verification or {}
     metadata = _patch_source_metadata(case, base_dir)
+    public_metadata = {
+        "contract_name": str(metadata.get("target_contract_name", "")).strip(),
+    }
 
     # --- Priority 1: on-disk source_dir (files are flattened, unflatten keys) ---
     source_dir_text = (
@@ -503,12 +511,12 @@ def _load_reference_sources(
                     logical_path = unflatten_source_filename(full_path.name)
                     sources[logical_path] = full_path.read_text(errors="replace")
             if sources:
-                return sources, []
+                return sources, [], public_metadata
 
     # --- Priority 2: case-bundled vulnerable code ---
     local_sources = case.get_vulnerable_code(base_dir)
     if local_sources:
-        return local_sources, []
+        return local_sources, [], public_metadata
 
     # --- Priority 3: fetch verified source via API (preserves full paths) ---
     candidate_addresses: list[str] = []
@@ -536,9 +544,11 @@ def _load_reference_sources(
             remappings = verified.get("remappings", [])
             if not isinstance(remappings, list):
                 remappings = []
-            return sources, remappings
+            return sources, remappings, {
+                "contract_name": str(verified.get("contract_name", "")).strip(),
+            }
 
-    return {}, []
+    return {}, [], public_metadata
 
 
 # ---------------------------------------------------------------------------
@@ -700,12 +710,6 @@ def evaluate_patch(
             str(ground_truth.get("file", "")).strip(),
         ],
     )
-    if not contract_name:
-        score.test_output = "Could not parse contract name from patched code"
-        score.compiles = _looks_like_valid_solidity(sanitized_patched_code)
-        _append_patch_note(score, "failed to parse contract name from patched code")
-        _finalize_patch_summary(score)
-        return score
 
     # --- Set up temp files ---
     case_slug = case.id.replace("-", "_")
@@ -735,7 +739,36 @@ def evaluate_patch(
             source_origin = "verified"
         compile_note = ""
         effective_compiler_version = compiler_version or infer_solc_version_from_source(sanitized_patched_code)
-        reference_sources, source_remappings = _load_reference_sources(case, base_dir)
+        reference_sources, source_remappings, public_source_metadata = _load_reference_sources(
+            case, base_dir
+        )
+        trusted_contract_name = (
+            str(public_source_metadata.get("contract_name", "")).strip()
+            or str(metadata.get("target_contract_name", "")).strip()
+        )
+        if trusted_contract_name:
+            contract_name = trusted_contract_name
+        target_source_unit = ""
+        artifact_source_unit = ""
+        if reference_sources:
+            target_source_unit = resolve_reference_source_unit(
+                reference_sources=reference_sources,
+                source_unit_hints=public_source_unit_hints(
+                    getattr(case, "raw", {}),
+                    getattr(case, "contracts", {}),
+                ),
+                contract_name_hint=trusted_contract_name,
+            )
+            artifact_source_unit = resolve_reference_contract_source_unit(
+                reference_sources=reference_sources,
+                contract_name=trusted_contract_name,
+            )
+        elif not contract_name:
+            score.test_output = "Could not parse contract name from patched code"
+            score.compiles = _looks_like_valid_solidity(sanitized_patched_code)
+            _append_patch_note(score, "failed to parse contract name from patched code")
+            _finalize_patch_summary(score)
+            return score
         try:
             if str(metadata.get("source_dir", "")).strip():
                 bytecode, compiled_version, compiled_contract_name = compile_dfhl_fixed_bytecode(
@@ -746,6 +779,8 @@ def evaluate_patch(
                     contract_name_hint=contract_name
                     or str(verification.get("target_contract_name", "")).strip()
                     or str(metadata.get("target_contract_name", "")).strip(),
+                    target_source_unit=target_source_unit,
+                    artifact_source_unit=artifact_source_unit,
                 )
             else:
                 bytecode, compiled_contract_name = compile_fixed_bytecode_from_source(
@@ -754,6 +789,8 @@ def evaluate_patch(
                     compiler_version=effective_compiler_version,
                     reference_sources=reference_sources,
                     source_remappings=source_remappings,
+                    target_source_unit=target_source_unit,
+                    artifact_source_unit=artifact_source_unit,
                 )
                 compiled_version = effective_compiler_version
             fixed_code_line = f'bytes memory _fixedCode = hex"{bytecode}";'
@@ -763,10 +800,11 @@ def evaluate_patch(
             )
         except RuntimeError as exc:
             canonical_patched = _canonical_source(sanitized_patched_code)
-            canonical_originals = {
-                _canonical_source(code)
-                for code in reference_sources.values()
-            }
+            canonical_original = (
+                _canonical_source(reference_sources[target_source_unit])
+                if target_source_unit
+                else ""
+            )
             vulnerable_address = ""
             if case.chain_context:
                 addresses = case.chain_context.get("vulnerable_addresses", []) or []
@@ -780,7 +818,7 @@ def evaluate_patch(
                 if isinstance(raw_block, int):
                     fork_block = raw_block
 
-            if canonical_patched in canonical_originals and vulnerable_address:
+            if canonical_patched == canonical_original and canonical_original and vulnerable_address:
                 runtime_code = lookup_runtime_code(
                     case.chain_context.get("fork_chain", "") or case.chain or "ethereum",
                     vulnerable_address,
