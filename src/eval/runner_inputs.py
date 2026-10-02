@@ -63,13 +63,15 @@ def _fix_input_lines(
     _ = review_mode
     _ = benchmark_dir
     raw = dict(getattr(case, "raw", {}) or {})
+    raw_proxy = raw.get("proxy_address")
+    proxy_address = "" if raw_proxy is None else str(raw_proxy).strip()
     lines = [
         f"chain: {str(raw.get('chain', case.chain)).strip()}",
         f"contract_address: {str(raw.get('vulnerable_address', '')).strip()}",
         f"type: {str(raw.get('type', '')).strip()}",
         f"file: {str(raw.get('file', '')).strip()}",
         f"function: {str(raw.get('function', '')).strip()}",
-        f"proxy_address: {str(raw.get('proxy_address', '')).strip()}",
+        f"proxy_address: {proxy_address}",
         f"block_number: {raw.get('block_number', '')}",
     ]
     attack_txs = raw.get("attack_txs", [])

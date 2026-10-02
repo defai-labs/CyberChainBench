@@ -54,7 +54,8 @@ class PatchCase(_CaseBase):
         flat_type = str(data.get("type", "")).strip()
         flat_file = str(data.get("file", "")).strip()
         flat_function = str(data.get("function", "")).strip()
-        flat_proxy = str(data.get("proxy_address", "")).strip()
+        raw_proxy = data.get("proxy_address")
+        flat_proxy = "" if raw_proxy is None else str(raw_proxy).strip()
         flat_fixable = data.get("fixable") if isinstance(data.get("fixable"), bool) else None
         flat_attack_txs = _coerce_string_list(data.get("attack_txs", []))
         flat_block_raw = data.get("block_number") if data.get("block_number") not in (None, "") else data.get("block")

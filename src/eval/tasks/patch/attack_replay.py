@@ -256,7 +256,8 @@ def validate_patch_attack_transactions(
     # For proxy cases, etch the proxy address directly (vm.etch + delegatecall
     # has caching issues in forked mode — etch proxy to bypass delegatecall)
     raw = getattr(case, "raw", {}) or {}
-    proxy_address = str(raw.get("proxy_address", "")).strip()
+    raw_proxy = raw.get("proxy_address")
+    proxy_address = "" if raw_proxy is None else str(raw_proxy).strip()
     etch_target = proxy_address if proxy_address else contract_address
     payload: dict[str, object] = {
         "ok": False,
