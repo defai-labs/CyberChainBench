@@ -10,6 +10,7 @@ Usage:
     export HTTPS_PROXY=http://127.0.0.1:18080
 """
 import http.server
+import re
 import socket
 import socketserver
 import select
@@ -84,18 +85,42 @@ def is_allowed(hostname: str) -> bool:
     return False
 
 
+def allowed_connect_target(authority: str) -> tuple[str, int] | None:
+    """Parse a hostname authority and apply the CONNECT destination policy."""
+    match = re.fullmatch(r"([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*)(?::([0-9]+))?", authority)
+    if match is None:
+        return None
+    host, port_text = match.groups()
+    if len(host) > 253 or any(
+        len(label) > 63 or label.startswith("-") or label.endswith("-")
+        for label in host.split(".")
+    ):
+        return None
+    try:
+        port = int(port_text) if port_text is not None else 443
+    except ValueError:
+        return None
+    if not 1 <= port <= 65535:
+        return None
+    host = host.lower()
+    # The pinned decompiler needs only this exact HTTPS authority, not subdomains.
+    if is_allowed(host) or (host == "ethervm.io" and port_text == "443"):
+        return host, port
+    return None
+
+
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
     timeout = 30
 
     def do_CONNECT(self):
         """Handle HTTPS CONNECT tunneling."""
-        host = self.path.split(":")[0]
-        if not is_allowed(host):
-            self.send_error(403, f"Blocked: {host} not in whitelist")
+        target = allowed_connect_target(self.path)
+        if target is None:
+            self.send_error(403, "Blocked: CONNECT destination not in whitelist")
             return
 
+        host, port = target
         try:
-            port = int(self.path.split(":")[1]) if ":" in self.path else 443
             remote = socket.create_connection((host, port), timeout=10)
         except Exception as e:
             self.send_error(502, f"Cannot connect to {self.path}: {e}")
